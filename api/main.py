@@ -1,0 +1,15 @@
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from api.db import close_pool, create_pool
+from api.routes.findings import router as findings_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await create_pool()
+    yield
+    await close_pool(app.state.pool)
+
+
+app = FastAPI(title="Findings API", version="1.0.0", lifespan=lifespan)
+app.include_router(findings_router, prefix="/findings", tags=["findings"])
