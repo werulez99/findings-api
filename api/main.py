@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from api.db import close_pool, create_pool
 from api.routes.findings import router as findings_router
 
@@ -12,4 +13,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Findings API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 app.include_router(findings_router, prefix="/findings", tags=["findings"])
