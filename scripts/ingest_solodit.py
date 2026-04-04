@@ -251,7 +251,9 @@ def fetch_page(offset: int, limit: int) -> dict[str, Any]:
                 log.error("API key rejected (HTTP 401). Check SOLODIT_API_KEY.")
                 sys.exit(1)
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                log.info("Raw API response preview: %s", str(data)[:500])
+                return data
             log.warning("HTTP %d on attempt %d — body: %s",
                         resp.status_code, attempt, resp.text[:300])
             time.sleep(3 * attempt)
