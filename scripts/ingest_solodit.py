@@ -228,7 +228,8 @@ def _extract_nested_str(raw: dict, parent: str, *child_keys: str) -> str:
 # ── Solodit API fetcher ───────────────────────────────────────────────────────
 
 def fetch_page(offset: int, limit: int) -> dict[str, Any]:
-    payload = {"offset": offset, "limit": limit}
+    page_number = (offset // limit) + 1
+    payload = {"page": page_number, "pageSize": limit}
     headers = {
         "X-Cyfrin-API-Key": SOLODIT_API_KEY,
         "Content-Type":     "application/json",
@@ -253,6 +254,7 @@ def fetch_page(offset: int, limit: int) -> dict[str, Any]:
             if resp.status_code == 200:
                 data = resp.json()
                 log.info("Raw API response preview: %s", str(data)[:500])
+                log.info("Metadata: %s", data.get("metadata", {}))
                 return data
             log.warning("HTTP %d on attempt %d — body: %s",
                         resp.status_code, attempt, resp.text[:300])
@@ -532,6 +534,7 @@ def run() -> None:
             total_dupes    += batch_dupes
             total_skipped  += batch_skipped
             offset         += len(items)
+            page_number += 1
 
             log.info(
                 "Batch summary — mapped=%d inserted=%d dupes=%d skipped=%d",
