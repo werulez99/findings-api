@@ -229,7 +229,15 @@ def _extract_nested_str(raw: dict, parent: str, *child_keys: str) -> str:
 
 def fetch_page(offset: int, limit: int) -> dict[str, Any]:
     page_number = (offset // limit) + 1
-    payload = {}
+    payload = {
+        "page": page_number,
+        "pageSize": limit,
+        "filters": {
+            "impact": ["HIGH", "MEDIUM", "LOW", "GAS"],
+            "sortField": "Recency",
+            "sortDirection": "Desc",
+        }
+    }
     headers = {
         "X-Cyfrin-API-Key": SOLODIT_API_KEY,
         "Content-Type":     "application/json",
