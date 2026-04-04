@@ -118,10 +118,8 @@ class FindingsService:
         data_sql = _compose_sql(_SUMMARY_COLS, where, sort, search, search_param_index, limit_ph, offset_ph)
         data_params = [*base_params, limit, offset]
         async with self._pool.acquire() as conn:
-            total, rows = await asyncio.gather(
-                conn.fetchval(count_sql, *base_params),
-                conn.fetch(data_sql, *data_params),
-            )
+            total = await conn.fetchval(count_sql, *base_params)
+            rows = await conn.fetch(data_sql, *data_params)
         return FindingsPage(total=int(total or 0), limit=limit, offset=offset, items=[_to_summary(r) for r in rows])
 
     async def get_finding(self, finding_id: uuid.UUID) -> FindingDetail | None:
