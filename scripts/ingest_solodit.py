@@ -542,7 +542,6 @@ def run() -> None:
             total_dupes    += batch_dupes
             total_skipped  += batch_skipped
             offset         += len(items)
-            page_number += 1
 
             log.info(
                 "Batch summary — mapped=%d inserted=%d dupes=%d skipped=%d",
