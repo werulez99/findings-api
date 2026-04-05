@@ -37,6 +37,44 @@ from typing import Any
 
 import requests
 
+
+
+# ── Junk-finding filter ─────────────────────────────────────────────────────
+JUNK_PREFIXES = ['HAL-']
+JUNK_KEYWORDS = [
+    'android', ' ios ', 'iphone', 'mobile app',
+    'certificate pinning', 'jailbreak', 'biometric',
+    'keychain', 'clipboard', 'screenshot', 'overlay attack',
+    'root detection', 'ssl pinning', 'content-security-policy',
+    'password policy', 'third-party iframe', 'verbose logging',
+    'xss', 'csrf', 'sql injection', 'floating pragma',
+    'use of unsafe', 'custom errors should', 'named mappings',
+    'length of an array is not cached',
+    'use of memory instead of calldata',
+    'insufficient test coverage',
+    'gas optimization', 'consider using',
+    '- android -', '- ios -', '- be -', '- api -',
+]
+
+
+def is_valid_finding(title: str, severity: str) -> bool:
+    t = (title or '').lower()
+    s = (severity or '').upper().strip()
+
+    # Reject gas/informational severity
+    if s in ['INFORMATIONAL', 'INFO', 'GAS', 'NONE']:
+        return False
+
+    # Reject by title prefix
+    if any(title.startswith(p) for p in JUNK_PREFIXES):
+        return False
+
+    # Reject by keyword in title
+    if any(k in t for k in JUNK_KEYWORDS):
+        return False
+
+    return True
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -480,7 +518,7 @@ def run() -> None:
             items = extract_items(page)
 
             if not items:
-                log.info("No items returned — reached end of Solodit data.")
+                log.info("API exhausted — all findings ingested.")
                 break
 
             log.info("Received %d items from API.", len(items))
@@ -495,6 +533,9 @@ def run() -> None:
                     mapped = map_record(raw, record_index)
                     record_index += 1
                     if mapped is None:
+                        batch_skipped += 1
+                        continue
+                    if not is_valid_finding(mapped["title"], mapped["severity"]):
                         batch_skipped += 1
                         continue
                     batch_mapped.append(mapped)
@@ -559,6 +600,11 @@ def run() -> None:
                 "Batch summary — mapped=%d inserted=%d dupes=%d skipped=%d",
                 len(batch_mapped), batch_inserted, batch_dupes, batch_skipped,
             )
+
+            # Safety cap
+            if total_fetched >= INGEST_LIMIT:
+                log.info("INGEST_LIMIT (%d) reached — stopping.", INGEST_LIMIT)
+                break
 
             # Polite pause between pages
             if len(items) == batch_limit:
