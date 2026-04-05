@@ -455,11 +455,23 @@ def run() -> None:
     total_dupes    = 0
     total_skipped  = 0
     record_index   = 0
-    offset         = 0
+
+    # Find how many findings already exist to skip past them
+    if conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM findings")
+            existing_count = cur.fetchone()[0]
+    else:
+        existing_count = 0
+
+    # Start Solodit pagination from where we left off
+    offset = existing_count
+    log.info("DB has %d findings — starting Solodit fetch from offset %d",
+             existing_count, offset)
 
     try:
-        while total_fetched < INGEST_LIMIT:
-            batch_limit = min(BATCH_SIZE, INGEST_LIMIT - total_fetched)
+        while True:
+            batch_limit = BATCH_SIZE
 
             log.info("─" * 40)
             log.info("Fetching offset=%d limit=%d…", offset, batch_limit)
@@ -549,7 +561,7 @@ def run() -> None:
             )
 
             # Polite pause between pages
-            if len(items) == batch_limit and total_fetched < INGEST_LIMIT:
+            if len(items) == batch_limit:
                 time.sleep(0.5)
 
             # Partial page = last page
