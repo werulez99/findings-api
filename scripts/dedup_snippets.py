@@ -148,46 +148,76 @@ def score_snippet(s):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def semantic_group_snippets(cluster_name, snippets):
-    """Ask Claude to group snippets by their underlying mechanism."""
+    """Ask Claude to group snippets by their underlying mechanism.
 
-    snippet_summaries = []
+    Uses the actual vulnerability code and fix pattern as the dedup signal,
+    not just metadata descriptions.
+    """
+
+    snippet_details = []
     for i, s in enumerate(snippets):
-        code_preview = (s.get("solidity_code", "") or "")[:200].replace("\n", " | ")
-        snippet_summaries.append(
-            f"ID:{i} pattern:{s.get('attack_pattern','?')} "
-            f"what_breaks:{(s.get('what_breaks','') or '')[:150]} "
-            f"code_preview:{code_preview[:100]}"
+        code = (s.get("solidity_code", "") or "")
+        # Extract the vulnerable lines — look for lines referenced in annotations
+        annotations = s.get("annotations", [])
+        if isinstance(annotations, str):
+            try: annotations = json.loads(annotations)
+            except: annotations = []
+
+        vuln_lines = []
+        code_lines = code.splitlines()
+        for ann in annotations:
+            if isinstance(ann, dict):
+                for ln in ann.get("line_numbers", []):
+                    if 1 <= ln <= len(code_lines):
+                        vuln_lines.append(f"  L{ln}: {code_lines[ln-1].strip()}")
+
+        vuln_code = "\n".join(vuln_lines[:6]) if vuln_lines else code[:300]
+
+        snippet_details.append(
+            f"--- SNIPPET {i} ---\n"
+            f"Pattern name: {s.get('attack_pattern','?')}\n"
+            f"Difficulty: {s.get('difficulty','?')}\n"
+            f"What breaks: {(s.get('what_breaks','') or '')[:200]}\n"
+            f"Vulnerable code:\n{vuln_code}\n"
+            f"Exploit path: {(s.get('exploit_path','') or '')[:200]}"
         )
 
-    summaries_text = "\n".join(snippet_summaries)
+    details_text = "\n\n".join(snippet_details)
 
-    prompt = f"""You are analyzing {len(snippets)} training snippets in the "{cluster_name}" vulnerability cluster.
+    prompt = f"""You are a smart contract security expert performing quality control on a training platform.
 
-Your job: identify which snippets teach the SAME underlying vulnerability mechanism. Two snippets are duplicates if:
-- They exploit the SAME root cause (e.g., both are "state update after external call")
-- An auditor who understands snippet A would immediately solve snippet B with the same knowledge
-- The fix for both would be the same type of code change
+CONTEXT: The "{cluster_name}" cluster has {len(snippets)} training snippets. Each snippet is a Solidity code challenge that teaches auditors to find a specific vulnerability. Your job is to identify snippets that teach the SAME lesson — even if they use different variable names or DeFi contexts.
 
-Two snippets are NOT duplicates if:
-- They exploit different mechanisms even if they're in the same category
-- They require different knowledge to solve
-- The fix would be fundamentally different
+THE DEDUP TEST — two snippets are duplicates if ALL THREE of these are true:
+1. FIX TEST: The same 1-line code fix pattern would prevent both vulnerabilities (e.g., both need "add a reentrancy guard", both need "check updatedAt timestamp", both need "update state before external call")
+2. KNOWLEDGE TEST: An auditor who learned to spot snippet A would IMMEDIATELY recognize snippet B without needing any new knowledge
+3. DETECTION TEST: A single static analysis rule could catch both bugs
+
+Two snippets are NOT duplicates if ANY of these differ:
+- The fix requires a fundamentally different code change
+- Understanding one does NOT help you find the other
+- They target different function types (e.g., one targets deposit(), other targets governance voting)
+- The attack sequence is meaningfully different (not just different token amounts)
+
+IMPORTANT: Different DeFi CONTEXTS doing the SAME mechanism ARE duplicates (e.g., "missing reentrancy guard in a vault" and "missing reentrancy guard in a staking pool" are the same lesson). But "classic reentrancy via ETH transfer" and "reentrancy via ERC721 callback" are DIFFERENT lessons because they require different detection knowledge.
 
 HERE ARE THE SNIPPETS:
-{summaries_text}
+{details_text}
 
-TASK: Group these snippets by root cause mechanism. Return ONLY valid JSON (no markdown fences):
+TASK: Group snippets by what they TEACH. Return ONLY valid JSON (no markdown fences):
 {{
   "groups": [
     {{
-      "mechanism": "state_update_after_external_call",
-      "mechanism_description": "External call is made before state variables are updated, allowing re-entry with stale state",
+      "mechanism": "short_technical_name",
+      "what_the_auditor_learns": "One sentence: what skill does solving this snippet build?",
+      "fix_pattern": "The 1-line fix that prevents this class of bug",
       "snippet_ids": [3, 7, 14],
       "is_duplicate_group": true
     }},
     {{
-      "mechanism": "erc777_callback_hook",
-      "mechanism_description": "ERC777 token hooks give sender execution control during transfer",
+      "mechanism": "different_mechanism",
+      "what_the_auditor_learns": "Different skill than the above",
+      "fix_pattern": "Different fix pattern",
       "snippet_ids": [5],
       "is_duplicate_group": false
     }}
@@ -196,11 +226,10 @@ TASK: Group these snippets by root cause mechanism. Return ONLY valid JSON (no m
 
 Rules:
 - Every snippet ID (0 to {len(snippets)-1}) must appear in EXACTLY one group
-- A group with 1 snippet has is_duplicate_group: false
-- A group with 2+ snippets has is_duplicate_group: true
-- Be STRICT about what counts as a duplicate — when in doubt, keep them separate
-- "Same category but different mechanism" is NOT a duplicate
-- "Same mechanism in different DeFi context" IS a duplicate"""
+- A group with 1 snippet: is_duplicate_group = false
+- A group with 2+ snippets: is_duplicate_group = true
+- STRICT MODE: when in doubt whether two snippets teach different things, keep them SEPARATE
+- Do NOT group snippets just because they are in the same vulnerability category — that is the CLUSTER's job. Within a cluster, we want maximum diversity."""
 
     try:
         r = client.messages.create(
