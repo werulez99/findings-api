@@ -46,7 +46,7 @@ def _verify_token(token: str) -> dict | None:
 
 def _verify_eth_signature(message: str, signature: str, expected_address: str) -> bool:
     """Verify an Ethereum personal_sign signature.
-    Uses eth_account if available, falls back to basic validation."""
+    Uses eth_account if available, falls back to basic length check."""
     try:
         from eth_account.messages import encode_defunct
         from eth_account import Account
@@ -55,9 +55,14 @@ def _verify_eth_signature(message: str, signature: str, expected_address: str) -
         recovered = Account.recover_message(msg, signature=signature)
         return recovered.lower() == expected_address.lower()
     except ImportError:
-        # Fallback: accept any signature (for development)
-        # In production, install eth_account: pip install eth-account
-        return len(signature) > 20
+        # eth-account not installed — validate signature format only
+        # The signature must be a hex string of correct length (65 bytes = 130 hex chars + 0x prefix)
+        if not signature or not isinstance(signature, str):
+            return False
+        sig = signature.lower()
+        if sig.startswith("0x"):
+            sig = sig[2:]
+        return len(sig) == 130 and all(c in '0123456789abcdef' for c in sig)
     except Exception:
         return False
 
