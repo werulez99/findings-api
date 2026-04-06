@@ -31,7 +31,7 @@ log = logging.getLogger("analyze")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
 CLUSTER_SLUG = os.environ.get("CLUSTER_SLUG", "")
-MAX_SNIPPETS = int(os.environ.get("MAX_SNIPPETS_PER_CLUSTER", "10"))
+MAX_SNIPPETS = int(os.environ.get("MAX_SNIPPETS_PER_CLUSTER", "15"))
 
 if not ANTHROPIC_API_KEY:
     log.error("Missing ANTHROPIC_API_KEY"); sys.exit(1)
@@ -88,7 +88,7 @@ def clear_cluster_snippets(cluster_id):
     log.info("  Cleared %d old snippets", deleted)
 
 
-def analyze_subpatterns(cluster_name, findings):
+def analyze_subpatterns(cluster_name, findings, existing_patterns=None):
     """Send findings to Claude to identify distinct root cause sub-patterns."""
     # Build a compact summary of all findings
     finding_summaries = []
@@ -100,14 +100,26 @@ def analyze_subpatterns(cluster_name, findings):
 
     findings_text = "\n".join(finding_summaries)
 
+    existing_note = ""
+    if existing_patterns:
+        existing_note = f"""
+
+CRITICAL DEDUP RULE: The following sub-patterns ALREADY EXIST. You must NOT generate anything that overlaps with these — not even the same bug mechanism with a different name.
+
+EXISTING PATTERNS (name + what the bug does):
+{chr(10).join(str(p) for p in existing_patterns)}
+
+Your new sub-patterns must each have a FUNDAMENTALLY DIFFERENT root cause from ALL of the above. "Different context, same bug" is NOT acceptable — the mechanism itself must be different."""
+
     prompt = f"""You are analyzing {len(findings)} real smart contract audit findings in the "{cluster_name}" category.
 
 Your job: identify the DISTINCT vulnerability sub-patterns in these findings. Many findings describe the same bug in different protocols — group them by ROOT CAUSE.
+{existing_note}
 
 HERE ARE THE FINDINGS:
 {findings_text}
 
-TASK: Analyze these findings and identify 5-10 distinct sub-patterns. For each sub-pattern:
+TASK: Analyze these findings and identify 8-15 distinct sub-patterns. For each sub-pattern:
 1. Give it a short technical name (snake_case)
 2. Classify difficulty: beginner (single function), intermediate (2-3 function interaction), advanced (complex state/cross-contract)
 3. Count how many of the findings match this sub-pattern
@@ -133,8 +145,9 @@ Rules:
 - Each sub-pattern must represent a GENUINELY DIFFERENT bug, not the same bug with different words
 - Sort by finding_count descending (most common first)
 - finding_counts should roughly sum to {len(findings)} (some findings may fit multiple patterns)
-- Minimum 5 sub-patterns, maximum 10
-- Be specific — "logic error" is too vague, "division before multiplication loses precision in fee calculation" is good"""
+- Minimum 8 sub-patterns, maximum 15
+- Be specific — "logic error" is too vague, "division before multiplication loses precision in fee calculation" is good
+- Include a mix of difficulties: at least 2 beginner, 3 intermediate, 2 advanced"""
 
     try:
         r = client.messages.create(
@@ -279,9 +292,32 @@ def run():
             log.warning("  Too few findings, skipping")
             continue
 
-        # Step 2: Analyze sub-patterns
-        log.info("  Analyzing sub-patterns via Claude...")
-        analysis = analyze_subpatterns(cname, findings)
+        # Step 2: Check existing snippets — get names AND descriptions for dedup
+        existing_patterns = []
+        existing_descriptions = []
+        with conn.cursor() as cur:
+            cur.execute("SELECT attack_pattern, what_breaks FROM training_snippets WHERE cluster_id = %s AND attack_pattern IS NOT NULL", (cid,))
+            for row in cur.fetchall():
+                existing_patterns.append(row[0])
+                if row[1]:
+                    existing_descriptions.append(f"- {row[0]}: {row[1][:120]}")
+
+        existing_count = len(existing_patterns)
+        remaining_budget = MAX_SNIPPETS - existing_count
+
+        if remaining_budget <= 0:
+            log.info("  Already has %d snippets (target: %d), skipping", existing_count, MAX_SNIPPETS)
+            continue
+
+        log.info("  Has %d snippets, need %d more (target: %d)", existing_count, remaining_budget, MAX_SNIPPETS)
+
+        # Step 3: Analyze sub-patterns (excluding existing ones)
+        log.info("  Analyzing NEW sub-patterns via Claude...")
+        existing_context = existing_patterns if existing_patterns else None
+        # If we have descriptions, use those instead (more context for dedup)
+        if existing_descriptions:
+            existing_context = existing_descriptions
+        analysis = analyze_subpatterns(cname, findings, existing_context)
 
         if not analysis or "sub_patterns" not in analysis:
             log.error("  Analysis failed, skipping cluster")
@@ -289,17 +325,17 @@ def run():
             continue
 
         sub_patterns = analysis["sub_patterns"]
-        log.info("  Found %d distinct sub-patterns:", len(sub_patterns))
-        for sp in sub_patterns:
+
+        # Filter out any that match existing pattern names
+        new_patterns = [sp for sp in sub_patterns if sp["name"] not in existing_patterns]
+        log.info("  Found %d new sub-patterns (%d total, %d already exist):", len(new_patterns), len(sub_patterns), existing_count)
+        for sp in new_patterns:
             log.info("    %-40s [%s] (%d findings) %s",
                      sp["name"], sp["difficulty"], sp["finding_count"],
                      sp["root_cause"][:80])
 
-        # Step 3: Clear old snippets and generate new ones
-        clear_cluster_snippets(cid)
-
-        # Generate one snippet per sub-pattern, up to MAX_SNIPPETS
-        snippets_to_generate = sub_patterns[:MAX_SNIPPETS]
+        # Generate one snippet per NEW sub-pattern, up to remaining budget
+        snippets_to_generate = new_patterns[:remaining_budget]
 
         for i, sp in enumerate(snippets_to_generate):
             log.info("  [%d/%d] Generating: %s [%s]...",
