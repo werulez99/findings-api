@@ -147,79 +147,124 @@ def score_snippet(s):
 # SEMANTIC GROUPING VIA CLAUDE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def semantic_group_snippets(cluster_name, snippets):
-    """Ask Claude to group snippets by their underlying mechanism.
+def extract_vulnerability_signature(snippet):
+    """Extract the core vulnerability pattern from a snippet's code.
+    Returns the vulnerable lines, the annotations, and a code context window."""
+    code = (snippet.get("solidity_code", "") or "")
+    code_lines = code.splitlines()
 
-    Uses the actual vulnerability code and fix pattern as the dedup signal,
-    not just metadata descriptions.
+    annotations = snippet.get("annotations", [])
+    if isinstance(annotations, str):
+        try: annotations = json.loads(annotations)
+        except: annotations = []
+
+    # Get annotated vulnerable lines with surrounding context
+    vuln_sections = []
+    seen_ranges = set()
+    for ann in annotations:
+        if not isinstance(ann, dict): continue
+        for ln in ann.get("line_numbers", []):
+            if ln in seen_ranges: continue
+            seen_ranges.add(ln)
+            # Get 2 lines before and after for context
+            start = max(0, ln - 3)
+            end = min(len(code_lines), ln + 2)
+            section_lines = []
+            for i in range(start, end):
+                marker = " >>> " if (i + 1) == ln else "     "
+                section_lines.append(f"{marker}L{i+1}: {code_lines[i].rstrip()}")
+            vuln_sections.append("\n".join(section_lines))
+            if ann.get("explanation"):
+                vuln_sections.append(f"     BUG: {ann['explanation'][:150]}")
+
+    return "\n".join(vuln_sections) if vuln_sections else code[:400]
+
+
+def semantic_group_snippets(cluster_name, snippets):
+    """Two-phase dedup: first extract signatures, then group by mechanism.
+
+    Phase 1: For each snippet, extract a "vulnerability signature" —
+             the exact code pattern + what makes it vulnerable.
+    Phase 2: Ask Claude to compare signatures and group by mechanism.
     """
 
-    snippet_details = []
+    # Phase 1: Build detailed vulnerability cards
+    cards = []
     for i, s in enumerate(snippets):
-        code = (s.get("solidity_code", "") or "")
-        # Extract the vulnerable lines — look for lines referenced in annotations
-        annotations = s.get("annotations", [])
-        if isinstance(annotations, str):
-            try: annotations = json.loads(annotations)
-            except: annotations = []
+        vuln_sig = extract_vulnerability_signature(s)
+        exploit = (s.get("exploit_path", "") or "")[:250]
+        what_breaks = (s.get("what_breaks", "") or "")[:200]
 
-        vuln_lines = []
-        code_lines = code.splitlines()
-        for ann in annotations:
-            if isinstance(ann, dict):
-                for ln in ann.get("line_numbers", []):
-                    if 1 <= ln <= len(code_lines):
-                        vuln_lines.append(f"  L{ln}: {code_lines[ln-1].strip()}")
+        # Extract the fix — what would you change to prevent this?
+        # This is the strongest dedup signal: same fix = same bug
+        why_missed = (s.get("why_missed", "") or "")[:150]
 
-        vuln_code = "\n".join(vuln_lines[:6]) if vuln_lines else code[:300]
-
-        snippet_details.append(
-            f"--- SNIPPET {i} ---\n"
-            f"Pattern name: {s.get('attack_pattern','?')}\n"
+        cards.append(
+            f"╔══ SNIPPET {i} ══╗\n"
+            f"Name: {s.get('attack_pattern','?')}\n"
             f"Difficulty: {s.get('difficulty','?')}\n"
-            f"What breaks: {(s.get('what_breaks','') or '')[:200]}\n"
-            f"Vulnerable code:\n{vuln_code}\n"
-            f"Exploit path: {(s.get('exploit_path','') or '')[:200]}"
+            f"\n"
+            f"VULNERABLE CODE (annotated lines marked with >>>):\n"
+            f"{vuln_sig}\n"
+            f"\n"
+            f"WHAT BREAKS: {what_breaks}\n"
+            f"ATTACK STEPS: {exploit}\n"
+            f"WHY AUDITORS MISS IT: {why_missed}\n"
+            f"╚{'═' * 30}╝"
         )
 
-    details_text = "\n\n".join(snippet_details)
+    cards_text = "\n\n".join(cards)
 
-    prompt = f"""You are a smart contract security expert performing quality control on a training platform.
+    prompt = f"""You are the lead security researcher at a top audit firm. You're reviewing {len(snippets)} training challenges in the "{cluster_name}" cluster to ensure each one teaches a DISTINCT skill.
 
-CONTEXT: The "{cluster_name}" cluster has {len(snippets)} training snippets. Each snippet is a Solidity code challenge that teaches auditors to find a specific vulnerability. Your job is to identify snippets that teach the SAME lesson — even if they use different variable names or DeFi contexts.
+YOUR TASK: Read each snippet's vulnerable code, attack path, and explanation. Then group them by what SKILL an auditor needs to solve them.
 
-THE DEDUP TEST — two snippets are duplicates if ALL THREE of these are true:
-1. FIX TEST: The same 1-line code fix pattern would prevent both vulnerabilities (e.g., both need "add a reentrancy guard", both need "check updatedAt timestamp", both need "update state before external call")
-2. KNOWLEDGE TEST: An auditor who learned to spot snippet A would IMMEDIATELY recognize snippet B without needing any new knowledge
-3. DETECTION TEST: A single static analysis rule could catch both bugs
+THE KEY QUESTION for each pair of snippets:
+"If I teach a junior auditor to solve snippet A, can they IMMEDIATELY solve snippet B without learning anything new?"
+- YES → they are duplicates (same lesson)
+- NO → they are different (different lesson)
 
-Two snippets are NOT duplicates if ANY of these differ:
-- The fix requires a fundamentally different code change
-- Understanding one does NOT help you find the other
-- They target different function types (e.g., one targets deposit(), other targets governance voting)
-- The attack sequence is meaningfully different (not just different token amounts)
+CONCRETE TESTS (a pair is duplicate only if ALL pass):
 
-IMPORTANT: Different DeFi CONTEXTS doing the SAME mechanism ARE duplicates (e.g., "missing reentrancy guard in a vault" and "missing reentrancy guard in a staking pool" are the same lesson). But "classic reentrancy via ETH transfer" and "reentrancy via ERC721 callback" are DIFFERENT lessons because they require different detection knowledge.
+TEST 1 — SAME FIX:
+  Write the fix for each snippet in one line.
+  If both fixes are the same pattern → duplicate signal.
+  Example: "add nonReentrant modifier" = same fix, even in different contracts.
+  Counter-example: "add nonReentrant" vs "check msg.sender == owner" = different fixes.
+
+TEST 2 — SAME DETECTION SKILL:
+  What does the auditor need to LOOK FOR to find this bug?
+  If both require looking for the same code pattern → duplicate signal.
+  Example: "look for external call before state update" = same detection skill.
+  Counter-example: "look for external call before state update" vs "look for missing callback handler" = different.
+
+TEST 3 — SAME MENTAL MODEL:
+  What concept does the auditor need to UNDERSTAND?
+  If both require the same conceptual understanding → duplicate signal.
+  Example: "understand that balanceOf can be manipulated by direct transfer" = same mental model.
+  Counter-example: "understand balanceOf manipulation" vs "understand oracle staleness" = different.
+
+STRICT RULE: When in doubt, keep snippets SEPARATE. False negatives (missing a duplicate) are much less harmful than false positives (deleting a unique lesson).
+
+NOT DUPLICATES even if they look similar:
+- Same bug type but triggered through different ENTRY POINTS (ETH transfer vs ERC721 callback vs ERC777 hook — these are 3 different lessons)
+- Same bug type but requiring different PREREQUISITE KNOWLEDGE
+- Same fix pattern but different DETECTION difficulty
 
 HERE ARE THE SNIPPETS:
-{details_text}
+{cards_text}
 
-TASK: Group snippets by what they TEACH. Return ONLY valid JSON (no markdown fences):
+Return ONLY valid JSON (no markdown fences):
 {{
+  "analysis_notes": "Brief notes on your reasoning for controversial groupings",
   "groups": [
     {{
       "mechanism": "short_technical_name",
-      "what_the_auditor_learns": "One sentence: what skill does solving this snippet build?",
-      "fix_pattern": "The 1-line fix that prevents this class of bug",
+      "the_one_lesson": "Complete this sentence: 'After this challenge, the auditor knows to...'",
+      "fix_in_one_line": "The exact code change that prevents this bug",
+      "detection_skill": "What the auditor looks for in code to find this bug",
       "snippet_ids": [3, 7, 14],
       "is_duplicate_group": true
-    }},
-    {{
-      "mechanism": "different_mechanism",
-      "what_the_auditor_learns": "Different skill than the above",
-      "fix_pattern": "Different fix pattern",
-      "snippet_ids": [5],
-      "is_duplicate_group": false
     }}
   ]
 }}
@@ -227,9 +272,9 @@ TASK: Group snippets by what they TEACH. Return ONLY valid JSON (no markdown fen
 Rules:
 - Every snippet ID (0 to {len(snippets)-1}) must appear in EXACTLY one group
 - A group with 1 snippet: is_duplicate_group = false
-- A group with 2+ snippets: is_duplicate_group = true
-- STRICT MODE: when in doubt whether two snippets teach different things, keep them SEPARATE
-- Do NOT group snippets just because they are in the same vulnerability category — that is the CLUSTER's job. Within a cluster, we want maximum diversity."""
+- A group with 2+ snippets: is_duplicate_group = true — these teach the same lesson
+- STRICT: when uncertain, keep them separate
+- Output the analysis_notes field explaining any close calls"""
 
     try:
         r = client.messages.create(
