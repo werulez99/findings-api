@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.db import close_pool, create_pool
 from api.routes.findings import router as findings_router
+from api.routes.training import router as training_router
 
 
 @asynccontextmanager
@@ -22,3 +23,4 @@ app.add_middleware(
 )
 
 app.include_router(findings_router, prefix="/findings", tags=["findings"])
+app.include_router(training_router, prefix="/training", tags=["training"])
