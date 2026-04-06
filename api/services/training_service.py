@@ -141,14 +141,21 @@ class TrainingService:
             LIMIT 20
         """
         total_sql = f"SELECT COUNT(*) FROM findings WHERE {_BASE_WHERE}"
+        protocols_sql = f"SELECT COUNT(DISTINCT protocol_name) FROM findings WHERE {_BASE_WHERE} AND protocol_name IS NOT NULL"
+        firms_sql = f"SELECT COUNT(DISTINCT firm_name) FROM findings WHERE {_BASE_WHERE} AND firm_name IS NOT NULL"
 
         async with self._pool.acquire() as conn:
             sev_rows = await conn.fetch(sev_sql)
             cat_rows = await conn.fetch(cat_sql)
             total = await conn.fetchval(total_sql)
+            protocols = await conn.fetchval(protocols_sql)
+            firms = await conn.fetchval(firms_sql)
 
         return {
             "total": total,
+            "total_protocols": protocols,
+            "total_firms": firms,
+            "total_categories": len(cat_rows),
             "severity_distribution": {r["severity"]: r["count"] for r in sev_rows},
             "category_distribution": [
                 {"category": r["vulnerability_category"], "count": r["count"]}

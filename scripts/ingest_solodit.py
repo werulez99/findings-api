@@ -483,9 +483,8 @@ def run() -> None:
     conn = None
     if not DRY_RUN:
         import psycopg
-        conn = psycopg.connect(DATABASE_URL)
-        conn.autocommit = False
-        log.info("Connected to database.")
+        conn = psycopg.connect(DATABASE_URL, autocommit=True, prepare_threshold=None)
+        log.info("Connected to database (autocommit, no prepared statements).")
 
     total_fetched  = 0
     total_mapped   = 0
@@ -502,10 +501,10 @@ def run() -> None:
     else:
         existing_count = 0
 
-    # Start Solodit pagination from where we left off
-    offset = existing_count
-    log.info("DB has %d findings — starting Solodit fetch from offset %d",
-             existing_count, offset)
+    # Always start from page 1 — dedup handles overlap
+    offset = 0
+    log.info("DB has %d findings — starting Solodit fetch from page 1 (dedup handles overlap)",
+             existing_count)
 
     try:
         while True:
@@ -565,30 +564,26 @@ def run() -> None:
                         m["risk_score"],
                     )
             else:
-                with conn.transaction():
-                    for mapped in batch_mapped:
-                        try:
-                            inserted = insert_finding(conn, mapped)
-                            if inserted:
-                                batch_inserted += 1
+                for mapped in batch_mapped:
+                    try:
+                        inserted = insert_finding(conn, mapped)
+                        if inserted:
+                            batch_inserted += 1
+                            if batch_inserted % 50 == 0 or batch_inserted <= 3:
                                 log.info(
                                     "  ✓ inserted: %r [%s | %s]",
                                     mapped["title"][:70],
                                     mapped["severity"],
                                     mapped["vulnerability_category"],
                                 )
-                            else:
-                                batch_dupes += 1
-                                log.info(
-                                    "  ~ duplicate: %r",
-                                    mapped["title"][:70],
-                                )
-                        except Exception as exc:
-                            log.warning(
-                                "  ✗ insert error for %r: %s",
-                                mapped.get("title","?")[:60], exc,
-                            )
-                            batch_skipped += 1
+                        else:
+                            batch_dupes += 1
+                    except Exception as exc:
+                        log.warning(
+                            "  ✗ insert error for %r: %s",
+                            mapped.get("title","?")[:60], exc,
+                        )
+                        batch_skipped += 1
 
             total_fetched  += len(items)
             total_inserted += batch_inserted
