@@ -16,16 +16,14 @@ Usage:
 Optional:
     CLUSTER_SLUG=oracle-dependency  (single cluster)
     MAX_SNIPPETS_PER_CLUSTER=15     (default: 15)
-    REPORT_MISMATCHED=true         (delete and regenerate mismatched snippets)
+    REPORT_MISMATCHED=true          (scan and log mismatched snippets, dry-run only)
 """
 
 import json
 import logging
 import os
-import re
 import sys
 import time
-from typing import Any
 
 import anthropic
 import psycopg
@@ -334,7 +332,8 @@ Return ONLY valid JSON:
 def resolve_anchor(code: str, anchor_text: str) -> int | None:
     """Find the line number of an anchor text in the code.
     Returns 1-indexed line number or None.
-    Requires a unique exact match — no fuzzy fallback."""
+    Pass 1: unique exact normalized equality. Pass 2: unique substring containment.
+    Returns None if no match or ambiguous."""
     if not anchor_text or not code:
         return None
 
@@ -720,12 +719,12 @@ def process_cluster(cluster: dict):
 
         code = data.get("solidity_code", "")
         code_lines_count = len(code.splitlines())
-        if len(code) < 100 or code_lines_count < 30:
-            log.warning("    Code too short (%d chars, %d lines)", len(code), code_lines_count)
+        if len(code) < 100 or code_lines_count < 35:
+            log.warning("    Code too short (%d chars, %d lines, min 35)", len(code), code_lines_count)
             stats["failures"] += 1
             continue
-        if code_lines_count > 120:
-            log.warning("    Code too long (%d lines, max 120)", code_lines_count)
+        if code_lines_count > 100:
+            log.warning("    Code too long (%d lines, max 100)", code_lines_count)
             stats["failures"] += 1
             continue
 
@@ -761,7 +760,7 @@ def run():
     log.info("Snippet Generation Pipeline v2")
     log.info("  Target: %s", CLUSTER_SLUG or "all clusters")
     log.info("  Max per cluster: %d", MAX_SNIPPETS)
-    log.info("  Replace mismatched: %s", REPORT_MISMATCHED)
+    log.info("  Mismatch scan: %s", "enabled (dry-run)" if REPORT_MISMATCHED else "disabled")
     log.info("=" * 70)
 
     clusters = fetch_clusters()
