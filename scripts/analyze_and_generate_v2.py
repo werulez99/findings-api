@@ -103,6 +103,43 @@ def validate_annotation_schema(ann: dict) -> bool:
     return validate_schema(ann, ["anchor_text", "label", "explanation"], "annotation")
 
 
+def validate_validator_schema(v: dict) -> bool:
+    """Validate that a validator response has all required fields."""
+    required = [
+        "pass", "matches_cluster", "best_cluster", "matches_subpattern",
+        "primary_bug", "secondary_bugs", "annotation_consistent",
+        "code_description_match", "exploit_executable", "economically_coherent",
+        "lesson_unique_enough", "realistic_enough", "reason",
+    ]
+    for field in required:
+        if field not in v:
+            log.warning("  Validator response missing field: '%s'", field)
+            return False
+    if not isinstance(v.get("secondary_bugs"), list):
+        log.warning("  Validator response: secondary_bugs is not a list")
+        return False
+    return True
+
+
+def build_existing_lesson_summaries(cluster_id) -> str:
+    """Build compact summaries of existing snippets in a cluster for dedup context."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT attack_pattern, what_breaks
+            FROM training_snippets
+            WHERE cluster_id = %s AND attack_pattern IS NOT NULL
+            LIMIT 40
+        """, (cluster_id,))
+        rows = cur.fetchall()
+    if not rows:
+        return ""
+    lines = []
+    for pattern, wb in rows:
+        short_wb = (wb or "")[:80].replace("\n", " ")
+        lines.append(f"- {pattern}: {short_wb}")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LLM HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -300,7 +337,7 @@ STRICT RULES:
 # STEP 3: SNIPPET GENERATION (SINGLE-BUG, ANCHOR-TEXT)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_snippet(cluster_name: str, subpattern: dict, referenced_findings: list[dict]) -> dict | None:
+def generate_snippet(cluster_name: str, subpattern: dict, referenced_findings: list[dict], existing_lessons: str = "") -> dict | None:
     """Generate a snippet grounded in specific findings, with anchor-text annotations."""
 
     examples_text = "\n".join(
@@ -315,6 +352,14 @@ def generate_snippet(cluster_name: str, subpattern: dict, referenced_findings: l
     sp_detection = subpattern.get("detection_skill", "")
     sp_fix = subpattern.get("fix_in_one_line", "")
 
+    existing_note = ""
+    if existing_lessons:
+        existing_note = f"""
+EXISTING LESSONS IN THIS CLUSTER (your snippet must teach something DIFFERENT):
+{existing_lessons}
+
+If your snippet would teach the same lesson as any of the above, choose a different angle."""
+
     prompt = f"""Generate a production-quality Solidity training snippet.
 
 CLUSTER: {cluster_name}
@@ -326,7 +371,7 @@ DIFFICULTY: {sp_diff}
 
 Real findings with this exact bug (inspiration only):
 {examples_text}
-
+{existing_note}
 CODE REQUIREMENTS:
 - pragma solidity ^0.8.19, 50-90 lines
 - NatSpec: /// @title, /// @notice, /// @param on contract and key functions
@@ -492,7 +537,7 @@ def resolve_all_anchors(data: dict) -> dict | None:
 # STEP 5: VALIDATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def validate_snippet(cluster_name: str, subpattern_name: str, data: dict) -> dict:
+def validate_snippet(cluster_name: str, subpattern_name: str, data: dict, existing_lessons: str = "") -> dict:
     """Second LLM pass: validate snippet before insertion."""
 
     code = data.get("solidity_code", "")
@@ -511,7 +556,7 @@ CODE:
 WHAT BREAKS: {what_breaks}
 EXPLOIT PATH: {exploit_path}
 ANNOTATIONS: {annotations}
-
+{"" if not existing_lessons else "EXISTING LESSONS IN CLUSTER (for uniqueness check):" + chr(10) + existing_lessons + chr(10)}
 Validate against ALL of these criteria:
 
 1. CLUSTER FIT: Is the primary bug genuinely a "{cluster_name}" issue? If not, what cluster fits better?
@@ -555,6 +600,9 @@ STRICT RULES:
     result = call_llm(prompt, max_tokens=1000)
     if not result:
         return {"pass": False, "reason": "Validator call failed"}
+
+    if not validate_validator_schema(result):
+        return {"pass": False, "reason": "Validator response missing required fields"}
 
     return result
 
@@ -784,6 +832,9 @@ def process_cluster(cluster: dict):
         log.info("  No new sub-patterns found, skipping")
         return
 
+    # ── Build existing lesson context for dedup ──
+    existing_lessons = build_existing_lesson_summaries(cid)
+
     # ── Steps 3-5: Generate, resolve, validate, insert ──
     to_generate = new_patterns[:remaining_budget]
 
@@ -799,7 +850,7 @@ def process_cluster(cluster: dict):
             continue
 
         # ── Step 3: Generate snippet ──
-        data = generate_snippet(cname, sp, referenced)
+        data = generate_snippet(cname, sp, referenced, existing_lessons=existing_lessons)
         if not data:
             log.warning("    Generation failed")
             stats["failures"] += 1
@@ -837,7 +888,7 @@ def process_cluster(cluster: dict):
 
         # ── Step 5: Validate ──
         log.info("    Validating...")
-        validation = validate_snippet(cname, sp["name"], resolved)
+        validation = validate_snippet(cname, sp["name"], resolved, existing_lessons=existing_lessons)
         stats["snippets_validated"] += 1
 
         if not should_insert(validation):
