@@ -16,7 +16,7 @@ Usage:
 Optional:
     CLUSTER_SLUG=oracle-dependency  (single cluster)
     MAX_SNIPPETS_PER_CLUSTER=15     (default: 15)
-    REPLACE_MISMATCHED=true         (delete and regenerate mismatched snippets)
+    REPORT_MISMATCHED=true         (delete and regenerate mismatched snippets)
 """
 
 import json
@@ -41,7 +41,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
 CLUSTER_SLUG = os.environ.get("CLUSTER_SLUG", "")
 MAX_SNIPPETS = int(os.environ.get("MAX_SNIPPETS_PER_CLUSTER", "15"))
-REPLACE_MISMATCHED = os.environ.get("REPLACE_MISMATCHED", "false").lower() in ("1", "true", "yes")
+REPORT_MISMATCHED = os.environ.get("REPORT_MISMATCHED", "false").lower() in ("1", "true", "yes")
 MODEL = "claude-sonnet-4-20250514"
 
 if not ANTHROPIC_API_KEY:
@@ -346,24 +346,28 @@ def resolve_anchor(code: str, anchor_text: str) -> int | None:
         return " ".join(s.split())
 
     anchor_norm = normalize(anchor_clean)
-    matches = []
 
+    # Pass 1: exact normalized equality (strongest signal)
+    exact_matches = []
     for i, line in enumerate(lines):
-        line_norm = normalize(line)
-        if anchor_norm in line_norm:
-            matches.append(i + 1)
+        if normalize(line) == anchor_norm:
+            exact_matches.append(i + 1)
 
-    # Require exactly one match for determinism
-    if len(matches) == 1:
-        return matches[0]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
 
-    # If multiple matches, try exact stripped equality
-    if len(matches) > 1:
-        exact = [m for m in matches if normalize(lines[m - 1]) == anchor_norm]
-        if len(exact) == 1:
-            return exact[0]
+    # Pass 2: substring containment (only if pass 1 found nothing)
+    if len(exact_matches) == 0:
+        substring_matches = []
+        for i, line in enumerate(lines):
+            if anchor_norm in normalize(line):
+                substring_matches.append(i + 1)
 
-    return None  # No match or ambiguous — fail
+        if len(substring_matches) == 1:
+            return substring_matches[0]
+
+    # Ambiguous or no match — fail
+    return None
 
 
 def resolve_all_anchors(data: dict) -> dict | None:
@@ -389,7 +393,7 @@ def resolve_all_anchors(data: dict) -> dict | None:
 
         # Verify it's not a comment, empty line, or brace
         line_text = code_lines[line_num - 1].strip() if line_num <= len(code_lines) else ""
-        if not line_text or line_text.startswith("///") or line_text.startswith("/**") or line_text in ("{", "}", "});"):
+        if not line_text or line_text.startswith("//") or line_text.startswith("/**") or line_text.startswith("*") or line_text in ("{", "}", "});"):
             log.warning("    Annotation anchor resolved to non-code line: L%d '%s'", line_num, line_text[:40])
             return None  # Reject — do not shift silently
 
@@ -435,7 +439,7 @@ def validate_snippet(cluster_name: str, subpattern_name: str, data: dict) -> dic
 ASSIGNED CLUSTER: {cluster_name}
 ASSIGNED SUB-PATTERN: {subpattern_name}
 
-CODE (truncated):
+CODE:
 {code}
 
 WHAT BREAKS: {what_breaks}
@@ -645,7 +649,7 @@ def process_cluster(cluster: dict):
     stats["clusters_processed"] += 1
 
     # ── Optional: identify mismatched snippets (dry-run only, no auto-delete) ──
-    if REPLACE_MISMATCHED:
+    if REPORT_MISMATCHED:
         mismatched = count_mismatched_snippets(cid, cname)
         if mismatched > 0:
             log.info("  Found %d potentially mismatched snippets (dry-run: not deleting)", mismatched)
@@ -715,8 +719,13 @@ def process_cluster(cluster: dict):
             continue
 
         code = data.get("solidity_code", "")
-        if len(code) < 100:
-            log.warning("    Code too short (%d chars)", len(code))
+        code_lines_count = len(code.splitlines())
+        if len(code) < 100 or code_lines_count < 30:
+            log.warning("    Code too short (%d chars, %d lines)", len(code), code_lines_count)
+            stats["failures"] += 1
+            continue
+        if code_lines_count > 120:
+            log.warning("    Code too long (%d lines, max 120)", code_lines_count)
             stats["failures"] += 1
             continue
 
@@ -752,7 +761,7 @@ def run():
     log.info("Snippet Generation Pipeline v2")
     log.info("  Target: %s", CLUSTER_SLUG or "all clusters")
     log.info("  Max per cluster: %d", MAX_SNIPPETS)
-    log.info("  Replace mismatched: %s", REPLACE_MISMATCHED)
+    log.info("  Replace mismatched: %s", REPORT_MISMATCHED)
     log.info("=" * 70)
 
     clusters = fetch_clusters()
