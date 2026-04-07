@@ -8,17 +8,19 @@ Produces a reviewable JSON report. Does NOT delete by default.
 Modes:
   AUDIT (default):
     python3 scripts/validate_existing_snippets.py
-    → writes report to validation_report.json
+    python3 scripts/validate_existing_snippets.py --only-legacy
+    → writes validation_report.json
 
   REVIEWED DELETE:
-    python3 scripts/validate_existing_snippets.py --delete-from approved_deletes.json
-    → deletes only snippet IDs listed in the approved file
+    python3 scripts/validate_existing_snippets.py --delete-from approved.json --report-from validation_report.json
+    → deletes only IDs that appear in BOTH the approved file AND the audit report
 
 Env vars:
     ANTHROPIC_API_KEY   required
     DATABASE_URL        required
     CLUSTER_SLUG        optional (single cluster)
     REPORT_PATH         optional (default: validation_report.json)
+    LEGACY_BEFORE       optional (ISO timestamp cutoff for legacy-only mode)
 """
 
 import argparse
@@ -38,6 +40,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
 CLUSTER_SLUG = os.environ.get("CLUSTER_SLUG", "")
 REPORT_PATH = os.environ.get("REPORT_PATH", "validation_report.json")
+LEGACY_BEFORE = os.environ.get("LEGACY_BEFORE", "")
 MODEL = "claude-sonnet-4-20250514"
 
 if not ANTHROPIC_API_KEY:
@@ -89,8 +92,6 @@ def call_llm(prompt: str, max_tokens: int = 1000, retries: int = 2) -> dict | No
 # ══════════════════════════════════════════════════════════════════════════════
 
 def validate_snippet(cluster_name: str, snippet: dict) -> dict:
-    """Validate a single snippet against quality criteria."""
-
     code = snippet.get("solidity_code", "")
     what_breaks = snippet.get("what_breaks", "")
     annotations = snippet.get("annotations", [])
@@ -117,7 +118,7 @@ Validate against these criteria:
 2. SINGLE BUG: Is there exactly one primary material vulnerability? List any secondary bugs.
 3. ANNOTATION CONSISTENCY: Do all annotations describe the same root cause?
 4. CODE-DESCRIPTION MATCH: Does what_breaks accurately describe the bug visible in the code?
-5. CODE QUALITY: Is the code realistic enough for training? Any compile contradictions (e.g., immutable + initializer)?
+5. CODE QUALITY: Is the code realistic enough for training? Any compile contradictions?
 
 Return ONLY valid JSON:
 {{
@@ -130,7 +131,7 @@ Return ONLY valid JSON:
   "annotation_consistent": true,
   "code_description_match": true,
   "code_quality_issues": [],
-  "reason": "Summary of validation result"
+  "reason": "Summary"
 }}
 
 Be strict. Quality is more important than volume."""
@@ -142,40 +143,24 @@ Be strict. Quality is more important than volume."""
 
 
 def is_flagged(v: dict) -> bool:
-    """Determine if a validation result should be flagged for review."""
-    if v.get("error"):
-        return True
-    if not v.get("pass", False):
-        return True
-    if not v.get("matches_cluster", False):
-        return True
-    if not v.get("single_bug", True):
-        return True
-    if not v.get("annotation_consistent", True):
-        return True
-    if not v.get("code_description_match", True):
-        return True
-    if len(v.get("secondary_bugs", [])) > 0:
-        return True
-    if len(v.get("code_quality_issues", [])) > 0:
-        return True
+    if v.get("error"): return True
+    if not v.get("pass", False): return True
+    if not v.get("matches_cluster", False): return True
+    if not v.get("single_bug", True): return True
+    if not v.get("annotation_consistent", True): return True
+    if not v.get("code_description_match", True): return True
+    if len(v.get("secondary_bugs", [])) > 0: return True
+    if len(v.get("code_quality_issues", [])) > 0: return True
     return False
 
 
 def recommended_action(v: dict) -> str:
-    """Determine recommended action based on validation result."""
-    if v.get("error"):
-        return "retry_validation"
-    if not v.get("matches_cluster", True):
-        return "delete_and_regenerate"
-    if len(v.get("secondary_bugs", [])) > 0:
-        return "delete_and_regenerate"
-    if not v.get("annotation_consistent", True):
-        return "fix_annotations"
-    if not v.get("code_description_match", True):
-        return "fix_description"
-    if len(v.get("code_quality_issues", [])) > 0:
-        return "review_quality"
+    if v.get("error"): return "retry_validation"
+    if not v.get("matches_cluster", True): return "delete_and_regenerate"
+    if len(v.get("secondary_bugs", [])) > 0: return "delete_and_regenerate"
+    if not v.get("annotation_consistent", True): return "fix_annotations"
+    if not v.get("code_description_match", True): return "fix_description"
+    if len(v.get("code_quality_issues", [])) > 0: return "review_quality"
     return "keep"
 
 
@@ -183,34 +168,54 @@ def recommended_action(v: dict) -> str:
 # DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_snippets() -> list[dict]:
+def fetch_snippets(only_legacy: bool = False, legacy_before: str = "") -> list[dict]:
+    conditions = []
+    params = []
+
+    if CLUSTER_SLUG:
+        conditions.append("pc.slug = %s")
+        params.append(CLUSTER_SLUG)
+
+    if only_legacy and legacy_before:
+        conditions.append("ts.created_at < %s")
+        params.append(legacy_before)
+    elif only_legacy:
+        # Default: use the v2 run start as cutoff (snippets created before today)
+        conditions.append("ts.created_at < %s")
+        params.append("2026-04-07T16:00:00Z")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
     with conn.cursor() as cur:
-        if CLUSTER_SLUG:
-            cur.execute("""
-                SELECT ts.id, ts.title, ts.difficulty, ts.solidity_code, ts.annotations,
-                       ts.what_breaks, ts.attack_pattern, ts.invariant, ts.exploit_path,
-                       ts.why_missed, pc.name as cluster_name, pc.slug as cluster_slug
-                FROM training_snippets ts
-                JOIN pattern_clusters pc ON ts.cluster_id = pc.id
-                WHERE pc.slug = %s
-                ORDER BY pc.name, ts.created_at
-            """, (CLUSTER_SLUG,))
-        else:
-            cur.execute("""
-                SELECT ts.id, ts.title, ts.difficulty, ts.solidity_code, ts.annotations,
-                       ts.what_breaks, ts.attack_pattern, ts.invariant, ts.exploit_path,
-                       ts.why_missed, pc.name as cluster_name, pc.slug as cluster_slug
-                FROM training_snippets ts
-                JOIN pattern_clusters pc ON ts.cluster_id = pc.id
-                ORDER BY pc.name, ts.created_at
-            """)
+        cur.execute(f"""
+            SELECT ts.id, ts.title, ts.difficulty, ts.solidity_code, ts.annotations,
+                   ts.what_breaks, ts.attack_pattern, ts.invariant, ts.exploit_path,
+                   ts.why_missed, ts.created_at,
+                   pc.name as cluster_name, pc.slug as cluster_slug
+            FROM training_snippets ts
+            JOIN pattern_clusters pc ON ts.cluster_id = pc.id
+            {where}
+            ORDER BY pc.name, ts.created_at
+        """, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def update_snippet_counts():
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE pattern_clusters SET snippet_count = COALESCE(sub.cnt, 0)
+            FROM (SELECT cluster_id, COUNT(*) as cnt FROM training_snippets GROUP BY cluster_id) sub
+            WHERE pattern_clusters.id = sub.cluster_id
+        """)
+        cur.execute("""
+            UPDATE pattern_clusters SET snippet_count = 0
+            WHERE id NOT IN (SELECT DISTINCT cluster_id FROM training_snippets)
+        """)
+
+
 def delete_by_ids(ids: list[str]) -> int:
-    if not ids:
-        return 0
+    if not ids: return 0
     import uuid
     uuids = [uuid.UUID(i) for i in ids]
     with conn.cursor() as cur:
@@ -222,18 +227,23 @@ def delete_by_ids(ids: list[str]) -> int:
 # AUDIT MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_audit():
+def run_audit(only_legacy: bool = False):
+    legacy_ts = LEGACY_BEFORE or ""
     log.info("=" * 70)
-    log.info("Legacy Snippet Validator — AUDIT MODE")
+    log.info("Snippet Validator — AUDIT MODE")
     log.info("  Target: %s", CLUSTER_SLUG or "all clusters")
+    log.info("  Legacy only: %s", only_legacy)
+    if only_legacy:
+        log.info("  Legacy cutoff: %s", legacy_ts or "default (2026-04-07T16:00:00Z)")
     log.info("  Report: %s", REPORT_PATH)
     log.info("=" * 70)
 
-    snippets = fetch_snippets()
+    snippets = fetch_snippets(only_legacy=only_legacy, legacy_before=legacy_ts)
     log.info("Found %d snippets to validate", len(snippets))
 
     report = {
         "mode": "audit",
+        "only_legacy": only_legacy,
         "total_scanned": 0,
         "passed": 0,
         "flagged": 0,
@@ -254,7 +264,6 @@ def run_audit():
 
         v = validate_snippet(cluster, s)
 
-        # Track per-cluster
         if cluster not in report["summary_by_cluster"]:
             report["summary_by_cluster"][cluster] = {"total": 0, "passed": 0, "flagged": 0}
         report["summary_by_cluster"][cluster]["total"] += 1
@@ -267,7 +276,7 @@ def run_audit():
             action = recommended_action(v)
             report["summary_by_action"][action] = report["summary_by_action"].get(action, 0) + 1
 
-            entry = {
+            report["flagged_snippets"].append({
                 "snippet_id": sid,
                 "cluster": cluster,
                 "cluster_slug": s["cluster_slug"],
@@ -277,8 +286,7 @@ def run_audit():
                 "validation": v,
                 "recommended_action": action,
                 "delete_candidate": action == "delete_and_regenerate",
-            }
-            report["flagged_snippets"].append(entry)
+            })
 
             if v.get("error"):
                 stats["errors"] += 1
@@ -290,25 +298,20 @@ def run_audit():
 
         time.sleep(0.5)
 
-    # Write report
     with open(REPORT_PATH, "w") as f:
         json.dump(report, f, indent=2, default=str)
 
     log.info("")
     log.info("=" * 70)
     log.info("VALIDATION REPORT")
-    log.info("=" * 70)
-    log.info("  Total scanned:  %d", report["total_scanned"])
-    log.info("  Passed:         %d", report["passed"])
-    log.info("  Flagged:        %d", report["flagged"])
-    log.info("  Errors:         %d", report["errors"])
-    log.info("")
-    log.info("  Actions breakdown:")
+    log.info("  Scanned: %d | Passed: %d | Flagged: %d | Errors: %d",
+             report["total_scanned"], report["passed"], report["flagged"], report["errors"])
+    log.info("  Delete candidates: %d",
+             sum(1 for f in report["flagged_snippets"] if f["delete_candidate"]))
+    log.info("  Actions:")
     for action, count in sorted(report["summary_by_action"].items(), key=lambda x: -x[1]):
         log.info("    %-30s %d", action, count)
-    log.info("")
-    log.info("  Delete candidates: %d", sum(1 for f in report["flagged_snippets"] if f["delete_candidate"]))
-    log.info("  Report written to: %s", REPORT_PATH)
+    log.info("  Report: %s", REPORT_PATH)
     log.info("=" * 70)
 
 
@@ -316,39 +319,54 @@ def run_audit():
 # REVIEWED DELETE MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_reviewed_delete(approved_file: str):
+def run_reviewed_delete(approved_file: str, report_file: str):
     log.info("=" * 70)
-    log.info("Legacy Snippet Validator — REVIEWED DELETE MODE")
+    log.info("Snippet Validator — REVIEWED DELETE MODE")
     log.info("  Approved file: %s", approved_file)
+    log.info("  Report file:   %s", report_file)
     log.info("=" * 70)
 
+    # Load approved IDs
     with open(approved_file) as f:
-        approved = json.load(f)
-
-    if isinstance(approved, dict):
-        ids = approved.get("approved_ids", [])
-    elif isinstance(approved, list):
-        ids = approved
+        approved_data = json.load(f)
+    if isinstance(approved_data, dict):
+        approved_ids = set(approved_data.get("approved_ids", []))
+    elif isinstance(approved_data, list):
+        approved_ids = set(approved_data)
     else:
         log.error("Invalid approved file format"); sys.exit(1)
 
-    log.info("  Approved IDs: %d", len(ids))
+    # Load report to get allowed deletion set
+    with open(report_file) as f:
+        report = json.load(f)
+    allowed_ids = set(
+        entry["snippet_id"]
+        for entry in report.get("flagged_snippets", [])
+    )
 
-    if not ids:
-        log.info("  Nothing to delete")
+    # Intersect: only delete IDs that are both approved AND in the report
+    valid_ids = approved_ids & allowed_ids
+    rejected_ids = approved_ids - allowed_ids
+
+    log.info("  Approved IDs requested:     %d", len(approved_ids))
+    log.info("  Allowed by report:          %d", len(allowed_ids))
+    log.info("  Approved AND in report:     %d", len(valid_ids))
+    log.info("  Rejected (not in report):   %d", len(rejected_ids))
+
+    if rejected_ids:
+        for rid in sorted(rejected_ids)[:10]:
+            log.warning("  REJECTED ID (not in report): %s", rid)
+        if len(rejected_ids) > 10:
+            log.warning("  ... and %d more rejected", len(rejected_ids) - 10)
+
+    if not valid_ids:
+        log.info("  Nothing to delete after intersection")
         return
 
-    deleted = delete_by_ids(ids)
-    log.info("  Deleted: %d snippets", deleted)
+    deleted = delete_by_ids(list(valid_ids))
+    log.info("  Deleted from database:      %d", deleted)
 
-    # Update counts
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE pattern_clusters SET snippet_count = COALESCE(sub.cnt, 0)
-            FROM (SELECT cluster_id, COUNT(*) as cnt FROM training_snippets GROUP BY cluster_id) sub
-            WHERE pattern_clusters.id = sub.cluster_id
-        """)
-
+    update_snippet_counts()
     log.info("  Snippet counts updated")
     log.info("=" * 70)
 
@@ -359,12 +377,20 @@ def run_reviewed_delete(approved_file: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Validate existing training snippets")
-    parser.add_argument("--delete-from", help="Path to approved deletion IDs JSON file")
+    parser.add_argument("--only-legacy", action="store_true",
+                        help="Only validate legacy snippets (before v2 run)")
+    parser.add_argument("--delete-from",
+                        help="Path to approved deletion IDs JSON file")
+    parser.add_argument("--report-from",
+                        help="Path to audit report (required for delete mode)")
     args = parser.parse_args()
 
     if args.delete_from:
-        run_reviewed_delete(args.delete_from)
+        if not args.report_from:
+            log.error("--report-from is required for delete mode")
+            sys.exit(1)
+        run_reviewed_delete(args.delete_from, args.report_from)
     else:
-        run_audit()
+        run_audit(only_legacy=args.only_legacy)
 
     conn.close()
