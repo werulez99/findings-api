@@ -185,46 +185,69 @@ def generate_snippet_for_subpattern(cluster_name, cluster_desc, subpattern, samp
         for f in examples
     )
 
-    prompt = f"""Generate a Solidity training snippet for this SPECIFIC vulnerability sub-pattern:
+    prompt = f"""Generate a production-quality Solidity training snippet for this vulnerability sub-pattern.
 
 CLUSTER: {cluster_name}
 SUB-PATTERN: {subpattern['name'].replace('_', ' ')}
 ROOT CAUSE: {subpattern['root_cause']}
 DIFFICULTY: {subpattern['difficulty']}
 
-Real audit findings with this exact bug (use as inspiration, don't copy):
+Real audit findings with this exact bug (inspiration only):
 {examples_text}
 
-RULES:
-1. Write 25-50 lines of clean Solidity (pragma solidity ^0.8.0;)
-2. The code must demonstrate THIS SPECIFIC sub-pattern — not a generic {cluster_name} bug
-3. Realistic variable names and structure — looks like real production code
-4. NO comments naming the bug. Code looks normal and correct at first glance.
-5. The vulnerability should require understanding the specific root cause described above
+CODE QUALITY REQUIREMENTS:
+1. pragma solidity ^0.8.19
+2. 50-90 lines of clean, realistic Solidity
+3. Add NatSpec comments: /// @title, /// @notice, /// @param, /// @dev on key functions
+4. Include at least 2 events and emit them in state-changing functions
+5. Use custom errors (error InsufficientBalance();) instead of string reverts
+6. Add 2-3 constants for magic numbers (MAX_RATE, MIN_DEPOSIT, etc.)
+7. Include import comments: // import "@openzeppelin/..."
+8. Realistic DeFi naming conventions (not generic names)
+9. The code must look like real production code that passed review
 
-Return ONLY valid JSON:
+VULNERABILITY REQUIREMENTS:
+1. EXACTLY ONE bug that matches the sub-pattern above
+2. The bug must be in the {cluster_name} category specifically
+3. NO comments naming or hinting at the bug
+4. The code should look correct at first glance
+5. The vulnerability requires understanding the specific root cause
+
+ANNOTATION REQUIREMENTS:
+1. BUG annotation must point to an actual code line (function call, state change, or check)
+2. IMPACT annotation must point to where the damage manifests
+3. NEVER point annotations at NatSpec comments, empty lines, or closing braces
+4. Hint line numbers must also point at real code lines
+
+EXPLANATION REQUIREMENTS:
+1. INVARIANT: 1-2 precise sentences stating what must hold, include math if applicable
+2. WHAT BREAKS: 2-3 sentences naming the specific mechanism and inconsistent state. Must clearly relate to {cluster_name}
+3. EXPLOIT PATH: 5 numbered steps with concrete values (ETH amounts, percentages, addresses)
+4. WHY MISSED: 2-3 sentences explaining the cognitive trap. What assumption does the auditor make?
+
+Return ONLY valid JSON (no markdown fences):
 {{
-  "title": "Short challenge title (do NOT reveal the specific bug)",
-  "solidity_code": "// SPDX-License-Identifier: MIT\\npragma solidity ^0.8.0;\\n...",
+  "title": "Short challenge title (do NOT reveal the bug)",
+  "solidity_code": "// SPDX-License-Identifier: MIT\\npragma solidity ^0.8.19;\\n...",
   "hints": [
-    {{"line_numbers": [N], "text": "Draw attention to the area without naming the bug", "cost": 0}},
-    {{"line_numbers": [N, M], "text": "More specific — point at the mechanism", "cost": 1}},
-    {{"line_numbers": [N, M, P], "text": "Almost gives it away — name what could go wrong", "cost": 1}}
+    {{"line_numbers": [N], "text": "Question about the area without naming the bug", "cost": 0}},
+    {{"line_numbers": [N, M], "text": "Point at the interaction between two elements", "cost": 1}},
+    {{"line_numbers": [N, M, P], "text": "Almost reveal what could go wrong", "cost": 1}}
   ],
   "annotations": [
-    {{"line_numbers": [N], "type": "vulnerable", "label": "VULNERABLE", "explanation": "Specific explanation of what is wrong on this line"}},
-    {{"line_numbers": [M], "type": "vulnerable", "label": "IMPACT", "explanation": "What the attacker achieves"}}
+    {{"line_numbers": [N], "type": "vulnerable", "label": "BUG", "explanation": "What is wrong on this specific line (1-2 sentences)"}},
+    {{"line_numbers": [M], "type": "vulnerable", "label": "IMPACT", "explanation": "What the attacker achieves by exploiting this (1-2 sentences)"}}
   ],
-  "invariant": "The specific invariant this sub-pattern violates",
-  "what_breaks": "One sentence: what exactly breaks and how",
-  "exploit_path": "1. Step one. 2. Step two. 3. Step three. 4. Impact with numbers if possible.",
-  "why_missed": "Why auditors specifically miss THIS sub-pattern (not generic advice)"
+  "invariant": "Precise formal invariant (1-2 sentences, include math relationship if applicable)",
+  "what_breaks": "Specific mechanism that breaks, naming the inconsistent state (2-3 sentences). Must relate to {cluster_name}.",
+  "exploit_path": "1. Attacker does X with concrete value. 2. This causes Y. 3. State becomes Z. 4. Attacker calls W. 5. Impact: loss of $N or percentage.",
+  "why_missed": "The cognitive trap: what the auditor assumes, why that assumption is wrong (2-3 sentences)."
 }}"""
 
     try:
         r = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=2500,
+            max_tokens=3500,
             messages=[{"role": "user", "content": prompt}],
         )
         text = r.content[0].text.strip()
