@@ -66,6 +66,44 @@ stats = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SCHEMA VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_schema(data: dict, required_fields: list[str], label: str = "response") -> bool:
+    """Check that all required fields exist and are non-empty in an LLM response."""
+    for field in required_fields:
+        if field not in data or data[field] is None:
+            log.warning("  Schema error in %s: missing field '%s'", label, field)
+            return False
+        val = data[field]
+        if isinstance(val, str) and len(val.strip()) == 0:
+            log.warning("  Schema error in %s: empty field '%s'", label, field)
+            return False
+        if isinstance(val, list) and len(val) == 0:
+            log.warning("  Schema error in %s: empty list '%s'", label, field)
+            return False
+    return True
+
+
+def validate_subpattern_schema(sp: dict) -> bool:
+    """Validate a single sub-pattern object."""
+    return validate_schema(sp, ["name", "root_cause", "finding_refs"], "sub-pattern")
+
+
+def validate_snippet_schema(data: dict) -> bool:
+    """Validate a generated snippet object."""
+    return validate_schema(data, [
+        "title", "solidity_code", "hints", "annotations",
+        "invariant", "what_breaks", "exploit_path", "why_missed"
+    ], "snippet")
+
+
+def validate_annotation_schema(ann: dict) -> bool:
+    """Validate a single annotation object."""
+    return validate_schema(ann, ["anchor_text", "label", "explanation"], "annotation")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LLM HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -430,8 +468,8 @@ def validate_snippet(cluster_name: str, subpattern_name: str, data: dict) -> dic
     """Second LLM pass: validate snippet before insertion."""
 
     code = data.get("solidity_code", "")
-    what_breaks = data.get("what_breaks", "")[:300]
-    annotations = json.dumps(data.get("annotations", []), indent=2)[:500]
+    what_breaks = data.get("what_breaks", "")
+    annotations = json.dumps(data.get("annotations", []), indent=2)
 
     prompt = f"""You are validating a Solidity training snippet before it enters a production training platform.
 
@@ -689,7 +727,9 @@ def process_cluster(cluster: dict):
     sub_patterns = analysis["sub_patterns"]
 
     # Filter out existing patterns
-    new_patterns = [sp for sp in sub_patterns if sp["name"] not in existing_patterns]
+    # Filter: not already existing + valid schema
+    new_patterns = [sp for sp in sub_patterns
+                    if sp.get("name") and sp["name"] not in existing_patterns and validate_subpattern_schema(sp)]
     log.info("  Found %d new sub-patterns (%d already exist)", len(new_patterns), existing_count)
 
     if not new_patterns:
@@ -714,6 +754,18 @@ def process_cluster(cluster: dict):
         data = generate_snippet(cname, sp, referenced)
         if not data:
             log.warning("    Generation failed")
+            stats["failures"] += 1
+            continue
+
+        if not validate_snippet_schema(data):
+            log.warning("    Snippet schema validation failed")
+            stats["failures"] += 1
+            continue
+
+        # Validate annotation schemas
+        annotations_valid = all(validate_annotation_schema(a) for a in data.get("annotations", []))
+        if not annotations_valid:
+            log.warning("    Annotation schema validation failed")
             stats["failures"] += 1
             continue
 
