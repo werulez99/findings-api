@@ -342,6 +342,7 @@ def run_reviewed_delete(approved_file: str, report_file: str):
     allowed_ids = set(
         entry["snippet_id"]
         for entry in report.get("flagged_snippets", [])
+        if entry.get("delete_candidate") is True
     )
 
     # Intersect: only delete IDs that are both approved AND in the report
