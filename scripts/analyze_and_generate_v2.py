@@ -745,8 +745,8 @@ def process_cluster(cluster: dict):
         # Get referenced findings — strict traceability, no fallback
         refs = sp.get("finding_refs", [])
         referenced = [screened[r] for r in refs if isinstance(r, int) and 0 <= r < len(screened)]
-        if len(referenced) < 2:
-            log.warning("    Sub-pattern has %d valid finding refs (need >= 2), skipping", len(referenced))
+        if len(referenced) < 1:
+            log.warning("    Sub-pattern has 0 valid finding refs, skipping")
             stats["failures"] += 1
             continue
 
@@ -775,8 +775,8 @@ def process_cluster(cluster: dict):
             log.warning("    Code too short (%d chars, %d lines, min 35)", len(code), code_lines_count)
             stats["failures"] += 1
             continue
-        if code_lines_count > 100:
-            log.warning("    Code too long (%d lines, max 100)", code_lines_count)
+        if code_lines_count > 130:
+            log.warning("    Code too long (%d lines, max 130)", code_lines_count)
             stats["failures"] += 1
             continue
 
