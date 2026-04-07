@@ -87,7 +87,7 @@ def validate_schema(data: dict, required_fields: list[str], label: str = "respon
 
 def validate_subpattern_schema(sp: dict) -> bool:
     """Validate a single sub-pattern object."""
-    return validate_schema(sp, ["name", "root_cause", "finding_refs"], "sub-pattern")
+    return validate_schema(sp, ["name", "root_cause", "finding_refs", "detection_skill", "fix_in_one_line"], "sub-pattern")
 
 
 def validate_snippet_schema(data: dict) -> bool:
@@ -254,11 +254,13 @@ Your new patterns must have FUNDAMENTALLY DIFFERENT root causes."""
 FINDINGS:
 {findings_text}
 
-For each sub-pattern:
-1. Give a technical snake_case name
-2. Set difficulty: beginner / intermediate / advanced
-3. Write 1 sentence describing the specific root cause
-4. List the finding indexes that match this sub-pattern
+For each sub-pattern, provide:
+1. name: technical snake_case
+2. difficulty: beginner / intermediate / advanced
+3. root_cause: 1 sentence describing the specific mechanism
+4. finding_refs: indexes of findings matching this pattern
+5. detection_skill: what an auditor looks for in code to find this bug
+6. fix_in_one_line: the single code change that prevents this class of bug
 
 Return ONLY valid JSON:
 {{
@@ -267,18 +269,24 @@ Return ONLY valid JSON:
       "name": "stale_price_no_freshness_check",
       "difficulty": "beginner",
       "root_cause": "Oracle price used without checking updatedAt, allowing stale data.",
-      "finding_refs": [0, 4, 7, 11]
+      "finding_refs": [0, 4, 7, 11],
+      "detection_skill": "Look for latestRoundData calls that ignore the updatedAt return value.",
+      "fix_in_one_line": "Add require(updatedAt > block.timestamp - MAX_STALENESS) after the oracle call."
     }}
   ]
 }}
 
-Rules:
-- Each sub-pattern must be a GENUINELY DIFFERENT mechanism
+STRICT RULES:
+- Each sub-pattern must teach a GENUINELY DIFFERENT detection skill
+- The DEDUP TEST: if an auditor who learned sub-pattern A could immediately solve sub-pattern B without learning a new detection skill, they are duplicates — merge them
+- Prefer UNDERREPRESENTED mechanisms over common ones already covered by existing snippets
 - Every finding index should appear in at least one sub-pattern
 - A finding can appear in at most 2 sub-patterns
 - 5-12 sub-patterns total
-- Include mix of difficulties: at least 1 beginner, 2 intermediate, 1 advanced
-- All sub-patterns must be genuine {cluster_name} bugs, not tangential issues"""
+- Mix of difficulties: at least 1 beginner, 2 intermediate, 1 advanced
+- All sub-patterns must be genuine {cluster_name} bugs, not tangential issues
+- Two sub-patterns with different fix_in_one_line values are likely distinct
+- Two sub-patterns with the same fix_in_one_line are likely duplicates — merge them"""
 
     result = call_llm(prompt, max_tokens=3000)
     if not result or "sub_patterns" not in result:
@@ -304,11 +312,16 @@ def generate_snippet(cluster_name: str, subpattern: dict, referenced_findings: l
     sp_root = subpattern["root_cause"]
     sp_diff = subpattern.get("difficulty", "intermediate")
 
+    sp_detection = subpattern.get("detection_skill", "")
+    sp_fix = subpattern.get("fix_in_one_line", "")
+
     prompt = f"""Generate a production-quality Solidity training snippet.
 
 CLUSTER: {cluster_name}
 SUB-PATTERN: {sp_name}
 ROOT CAUSE: {sp_root}
+DETECTION SKILL: {sp_detection}
+FIX: {sp_fix}
 DIFFICULTY: {sp_diff}
 
 Real findings with this exact bug (inspiration only):
@@ -323,15 +336,30 @@ CODE REQUIREMENTS:
 - Import comments: // import "@openzeppelin/..."
 - Realistic DeFi naming, looks like production code
 
-HARD RULES:
-- EXACTLY ONE primary vulnerability matching the sub-pattern above
-- NO secondary material bugs, misleading flaws, or compile contradictions
-- The bug must cleanly match "{cluster_name}" more than any other category
-- Do not use immutable variables with initializer-only assignment unless that IS the single bug
-- All annotations must refer to the SAME root cause
-- IMPACT must be the consequence of the SAME bug, not a second issue
-- Code should look correct at first glance
-- NO comments naming or hinting at the bug
+HARD RULES — ONE BUG, ONE LESSON:
+- The snippet must contain EXACTLY ONE material vulnerability in total
+- That bug must clearly belong to "{cluster_name}"
+- NO second bug from the same cluster
+- NO second bug from another cluster
+- BUG and IMPACT annotations must describe the SAME root cause
+- The exploit path must be actually executable from the shown code
+- The accounting/economic model must be coherent enough for the exploit to matter
+- The contract must be realistic enough to teach the intended bug without obvious unrelated breakage
+
+HARD PROHIBITIONS:
+- NO broken asset/accounting models unless that IS the one intended bug
+- NO impossible exploit narratives (e.g., claiming drain when no funds exist)
+- NO fake bridge/oracle/lending mechanics that are visibly incomplete and introduce extra bugs
+- NO dead security fields/constants that create an obvious second issue
+- NO multiple missing access controls across unrelated functions unless the single lesson is specifically about systemic missing protection
+- NO immutable variables with initializer-only assignment unless that IS the single bug
+
+BEFORE ANSWERING — internal self-check:
+1. What is the ONE primary bug? State it in one sentence.
+2. Is the exploit actually executable in the shown code?
+3. Is the accounting/economic flow coherent enough for the exploit to matter?
+4. Are there ANY other material bugs? If yes, rewrite until there is only one.
+5. Would another auditor classify this as "{cluster_name}"? If not, rewrite.
 
 ANNOTATION FORMAT — use anchor_text, NOT line numbers:
 Return the exact code string that identifies the vulnerable line.
@@ -469,9 +497,10 @@ def validate_snippet(cluster_name: str, subpattern_name: str, data: dict) -> dic
 
     code = data.get("solidity_code", "")
     what_breaks = data.get("what_breaks", "")
+    exploit_path = data.get("exploit_path", "")
     annotations = json.dumps(data.get("annotations", []), indent=2)
 
-    prompt = f"""You are validating a Solidity training snippet before it enters a production training platform.
+    prompt = f"""You are a strict quality gate for a Solidity training snippet platform.
 
 ASSIGNED CLUSTER: {cluster_name}
 ASSIGNED SUB-PATTERN: {subpattern_name}
@@ -480,16 +509,24 @@ CODE:
 {code}
 
 WHAT BREAKS: {what_breaks}
-
+EXPLOIT PATH: {exploit_path}
 ANNOTATIONS: {annotations}
 
-Validate this snippet against these criteria:
+Validate against ALL of these criteria:
 
-1. CLUSTER FIT: Is the primary bug genuinely a "{cluster_name}" issue? Or does it fit another category better?
+1. CLUSTER FIT: Is the primary bug genuinely a "{cluster_name}" issue? If not, what cluster fits better?
 2. SUB-PATTERN FIT: Does the bug match "{subpattern_name}"?
-3. SINGLE BUG: Is there exactly one primary material vulnerability? Are there any secondary bugs?
-4. ANNOTATION CONSISTENCY: Do BUG and IMPACT annotations describe the same root cause?
-5. WHAT_BREAKS MATCH: Does the what_breaks text match what the code actually shows?
+3. SINGLE BUG: Is there EXACTLY ONE material vulnerability total? List ALL secondary bugs found, including:
+   - extra missing access controls on other functions
+   - broken accounting models unrelated to the intended bug
+   - dead/unused security fields that constitute a second issue
+   - compile contradictions (immutable + initializer)
+4. ANNOTATION CONSISTENCY: Do BUG and IMPACT annotations describe the SAME root cause?
+5. CODE-DESCRIPTION MATCH: Does what_breaks accurately describe what the code shows?
+6. EXPLOIT EXECUTABLE: Is the described exploit actually executable from the shown code? Or does it require state/funds that the code cannot produce?
+7. ECONOMICALLY COHERENT: Is the accounting/asset model coherent enough for the exploit to have real impact? Or is the economic model so broken that the exploit narrative is fake?
+8. LESSON UNIQUE: Does this snippet teach a genuinely distinct lesson, or is it a common pattern that is already overrepresented?
+9. REALISTIC: Is the contract realistic enough to be used as training material? Or does it have obvious structural problems that distract from the intended bug?
 
 Return ONLY valid JSON:
 {{
@@ -500,16 +537,22 @@ Return ONLY valid JSON:
   "primary_bug": "description of the single primary bug",
   "secondary_bugs": [],
   "annotation_consistent": true,
-  "reason": "Snippet is clean and matches the assigned cluster."
+  "code_description_match": true,
+  "exploit_executable": true,
+  "economically_coherent": true,
+  "lesson_unique_enough": true,
+  "realistic_enough": true,
+  "reason": "Summary of validation result"
 }}
 
-Rules:
+STRICT RULES:
 - pass=false if ANY criterion fails
-- If the bug fits another cluster better, set matches_cluster=false and best_cluster to the better fit
-- secondary_bugs should list any additional material vulnerabilities found
-- Be strict: quality is more important than volume"""
+- secondary_bugs must list every additional material bug found, even small ones
+- exploit_executable=false if the exploit requires impossible preconditions
+- economically_coherent=false if the asset model makes the exploit meaningless
+- Be strict. Reject anything questionable. Quality over volume."""
 
-    result = call_llm(prompt, max_tokens=800)
+    result = call_llm(prompt, max_tokens=1000)
     if not result:
         return {"pass": False, "reason": "Validator call failed"}
 
@@ -517,12 +560,17 @@ Rules:
 
 
 def should_insert(validation: dict) -> bool:
-    """Check if validation result allows insertion."""
+    """Check if validation result allows insertion. All gates must pass."""
     return (
         validation.get("pass", False) is True
         and validation.get("matches_cluster", False) is True
         and validation.get("matches_subpattern", False) is True
         and validation.get("annotation_consistent", False) is True
+        and validation.get("code_description_match", False) is True
+        and validation.get("exploit_executable", False) is True
+        and validation.get("economically_coherent", False) is True
+        and validation.get("lesson_unique_enough", False) is True
+        and validation.get("realistic_enough", False) is True
         and len(validation.get("secondary_bugs", [])) == 0
     )
 
