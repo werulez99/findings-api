@@ -149,8 +149,8 @@ Rules:
 
     result = call_llm(prompt, max_tokens=4000)
     if not result or "classifications" not in result:
-        log.warning("  Screening failed, using all findings as fallback")
-        return findings
+        log.warning("  Screening failed — skipping cluster (no fallback to unscreened findings)")
+        return []
 
     # Filter to in-cluster findings
     in_indices = set()
@@ -332,29 +332,38 @@ Return ONLY valid JSON:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def resolve_anchor(code: str, anchor_text: str) -> int | None:
-    """Find the line number of an anchor text in the code. Returns 1-indexed line number or None."""
+    """Find the line number of an anchor text in the code.
+    Returns 1-indexed line number or None.
+    Requires a unique exact match — no fuzzy fallback."""
     if not anchor_text or not code:
         return None
 
     lines = code.splitlines()
     anchor_clean = anchor_text.strip()
 
-    # Exact match
+    # Normalize whitespace for comparison
+    def normalize(s):
+        return " ".join(s.split())
+
+    anchor_norm = normalize(anchor_clean)
+    matches = []
+
     for i, line in enumerate(lines):
-        if anchor_clean in line.strip():
-            return i + 1
+        line_norm = normalize(line)
+        if anchor_norm in line_norm:
+            matches.append(i + 1)
 
-    # Fuzzy: try stripping whitespace differences
-    anchor_words = anchor_clean.split()
-    if len(anchor_words) >= 3:
-        for i, line in enumerate(lines):
-            line_words = line.strip().split()
-            # Check if most anchor words appear in the line
-            matches = sum(1 for w in anchor_words if w in line_words)
-            if matches >= len(anchor_words) * 0.7:
-                return i + 1
+    # Require exactly one match for determinism
+    if len(matches) == 1:
+        return matches[0]
 
-    return None
+    # If multiple matches, try exact stripped equality
+    if len(matches) > 1:
+        exact = [m for m in matches if normalize(lines[m - 1]) == anchor_norm]
+        if len(exact) == 1:
+            return exact[0]
+
+    return None  # No match or ambiguous — fail
 
 
 def resolve_all_anchors(data: dict) -> dict | None:
@@ -375,21 +384,14 @@ def resolve_all_anchors(data: dict) -> dict | None:
         line_num = resolve_anchor(code, anchor)
 
         if line_num is None:
-            log.warning("    Could not resolve annotation anchor: '%s'", anchor[:60])
-            return None  # Critical failure
+            log.warning("    Could not resolve annotation anchor uniquely: '%s'", anchor[:60])
+            return None  # Critical failure — no silent fallback
 
-        # Verify it's not a comment or empty line
+        # Verify it's not a comment, empty line, or brace
         line_text = code_lines[line_num - 1].strip() if line_num <= len(code_lines) else ""
         if not line_text or line_text.startswith("///") or line_text.startswith("/**") or line_text in ("{", "}", "});"):
-            log.warning("    Annotation anchor resolved to comment/brace: L%d '%s'", line_num, line_text[:40])
-            # Try shifting to nearest code line
-            for offset in [1, -1, 2, -2, 3]:
-                candidate = line_num + offset
-                if 1 <= candidate <= len(code_lines):
-                    ct = code_lines[candidate - 1].strip()
-                    if ct and not ct.startswith("///") and ct not in ("{", "}", "});"):
-                        line_num = candidate
-                        break
+            log.warning("    Annotation anchor resolved to non-code line: L%d '%s'", line_num, line_text[:40])
+            return None  # Reject — do not shift silently
 
         resolved_annotations.append({
             "line_numbers": [line_num],
@@ -424,7 +426,7 @@ def resolve_all_anchors(data: dict) -> dict | None:
 def validate_snippet(cluster_name: str, subpattern_name: str, data: dict) -> dict:
     """Second LLM pass: validate snippet before insertion."""
 
-    code = data.get("solidity_code", "")[:1500]
+    code = data.get("solidity_code", "")
     what_breaks = data.get("what_breaks", "")[:300]
     annotations = json.dumps(data.get("annotations", []), indent=2)[:500]
 
@@ -526,8 +528,8 @@ def get_existing_snippets(cluster_id) -> tuple[list[str], list[str]]:
         return patterns, descriptions
 
 
-def delete_mismatched_snippets(cluster_id, cluster_name) -> int:
-    """Delete snippets that don't match their cluster theme. Returns count deleted."""
+def count_mismatched_snippets(cluster_id, cluster_name) -> int:
+    """Count snippets that don't match their cluster theme. DRY-RUN ONLY — does not delete."""
     # This is the keyword-based detection from earlier
     CLUSTER_KEYWORDS = {
         "reentrancy": ["reentran", "callback", "re-enter", "external call before", "cei"],
@@ -586,9 +588,7 @@ def delete_mismatched_snippets(cluster_id, cluster_name) -> int:
             to_delete.append(sid)
 
     if to_delete:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM training_snippets WHERE id = ANY(%s)", (to_delete,))
-        log.info("  Deleted %d mismatched snippets", len(to_delete))
+        log.info("  Mismatched snippet IDs (not deleting): %s", [str(s)[:8] for s in to_delete[:10]])
 
     return len(to_delete)
 
@@ -644,11 +644,12 @@ def process_cluster(cluster: dict):
     log.info("━" * 70)
     stats["clusters_processed"] += 1
 
-    # ── Optional: delete mismatched snippets first ──
+    # ── Optional: identify mismatched snippets (dry-run only, no auto-delete) ──
     if REPLACE_MISMATCHED:
-        deleted = delete_mismatched_snippets(cid, cname)
-        if deleted:
-            log.info("  Removed %d mismatched snippets", deleted)
+        mismatched = count_mismatched_snippets(cid, cname)
+        if mismatched > 0:
+            log.info("  Found %d potentially mismatched snippets (dry-run: not deleting)", mismatched)
+            log.info("  To delete these, run: DELETE FROM training_snippets WHERE id IN (select manually)")
 
     # ── Check existing snippets ──
     existing_patterns, existing_descriptions = get_existing_snippets(cid)
@@ -698,11 +699,13 @@ def process_cluster(cluster: dict):
     for i, sp in enumerate(to_generate):
         log.info("  [%d/%d] %s [%s]", i + 1, len(to_generate), sp["name"], sp.get("difficulty", "?"))
 
-        # Get referenced findings
+        # Get referenced findings — strict traceability, no fallback
         refs = sp.get("finding_refs", [])
-        referenced = [screened[r] for r in refs if r < len(screened)]
-        if not referenced:
-            referenced = screened[:5]  # Fallback to first 5 screened findings
+        referenced = [screened[r] for r in refs if isinstance(r, int) and 0 <= r < len(screened)]
+        if len(referenced) < 2:
+            log.warning("    Sub-pattern has %d valid finding refs (need >= 2), skipping", len(referenced))
+            stats["failures"] += 1
+            continue
 
         # ── Step 3: Generate snippet ──
         data = generate_snippet(cname, sp, referenced)
