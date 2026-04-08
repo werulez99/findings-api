@@ -114,3 +114,19 @@ async def sync_progress(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     return await service.sync_local_progress(user["id"], body.cluster_progress)
+
+
+@router.delete("/progress")
+async def reset_progress(
+    request: Request,
+    service: AuthService = Depends(get_service),
+):
+    """Reset all progress for the authenticated user."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="No token")
+    user = await service.get_user_by_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return await service.reset_progress(user["id"])

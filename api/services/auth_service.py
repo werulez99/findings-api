@@ -302,3 +302,15 @@ class AuthService:
             """, uid, stats["total_attempted"], stats["total_solved"])
 
         return {"synced": synced}
+
+    async def reset_progress(self, user_id: str) -> dict:
+        """Delete all progress for a user."""
+        uid = uuid.UUID(user_id)
+        async with self.pool.acquire() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM user_progress WHERE user_id = $1", uid
+            )
+            await conn.execute(
+                "UPDATE user_stats SET total_attempted = 0, total_solved = 0 WHERE user_id = $1", uid
+            )
+        return {"reset": True}
